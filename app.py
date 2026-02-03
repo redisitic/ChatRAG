@@ -5,13 +5,22 @@ import streamlit as st
 import re
 import os
 import time
-from datetime import datetime
 from dateutil import parser as dateparser
+from dotenv import load_dotenv
 
-from langchain.schema import Document
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.chains import RetrievalQA
+
+
+# =========================
+# LOAD ENVIRONMENT VARIABLES
+# =========================
+load_dotenv()
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 
 # =========================
@@ -20,6 +29,7 @@ from langchain.chains import RetrievalQA
 CHAT_FILE = "_chat.txt"
 VECTOR_DIR = "vectorstore"
 CHUNK_SIZE = 15
+BATCH_SIZE = 100  # Process embeddings in batches
 
 
 # =========================
@@ -47,7 +57,7 @@ def parse_whatsapp_chat(text):
 
             date, time_, sender, message = match.groups()
             buffer = {
-                "datetime": dateparser.parse(f"{date} {time_}",tdayfirst=True),
+                "datetime": dateparser.parse(f"{date} {time_}", dayfirst=True),
                 "sender": sender,
                 "message": message
             }
@@ -89,17 +99,50 @@ def chunk_documents(docs, size=CHUNK_SIZE):
 
 
 # =========================
-# VECTORSTORE
+# VECTORSTORE WITH BATCHING
 # =========================
-def build_vectorstore(chunks):
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-    vs = FAISS.from_documents(chunks, embeddings)
+def build_vectorstore(chunks, progress_bar=None, status_text=None):
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="models/text-embedding-004",
+        google_api_key=GOOGLE_API_KEY
+    )
+    
+    total_chunks = len(chunks)
+    if total_chunks <= BATCH_SIZE:
+        if status_text:
+            status_text.text(f"Creating embeddings for {total_chunks} chunks...")
+        vs = FAISS.from_documents(chunks, embeddings)
+    else:
+        vs = None
+        for i in range(0, total_chunks, BATCH_SIZE):
+            batch = chunks[i:i+BATCH_SIZE]
+            batch_num = i // BATCH_SIZE + 1
+            total_batches = (total_chunks + BATCH_SIZE - 1) // BATCH_SIZE
+            
+            if status_text:
+                status_text.text(f"Processing batch {batch_num}/{total_batches} ({len(batch)} chunks)...")
+            
+            if vs is None:
+                vs = FAISS.from_documents(batch, embeddings)
+            else:
+                vs_batch = FAISS.from_documents(batch, embeddings)
+                vs.merge_from(vs_batch)
+            
+            if progress_bar:
+                progress_bar.progress(min(1.0, (i + len(batch)) / total_chunks))
+    
+    if status_text:
+        status_text.text("Saving index to disk...")
+    
     vs.save_local(VECTOR_DIR)
     return vs
 
 
 def load_vectorstore():
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="models/text-embedding-004",
+        google_api_key=GOOGLE_API_KEY
+    )
     return FAISS.load_local(
         VECTOR_DIR,
         embeddings,
@@ -108,10 +151,23 @@ def load_vectorstore():
 
 
 # =========================
+# HELPER FUNCTION
+# =========================
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+
+
+# =========================
 # STREAMLIT SETUP
 # =========================
 st.set_page_config(page_title="WhatsApp RAG", layout="wide")
-st.title("📱 WhatsApp Chat RAG + Replay")
+st.title("WhatsApp Chat RAG + Replay")
+
+# Check API Key
+if not GOOGLE_API_KEY:
+    st.error("GOOGLE_API_KEY not found in .env file. Please create a .env file with your Google API key.")
+    st.info("Create a .env file in the same directory as this script with:\nGOOGLE_API_KEY=your_api_key_here")
+    st.stop()
 
 tabs = st.tabs(["Index", "Ask", "Replay"])
 
@@ -123,19 +179,42 @@ with tabs[0]:
     st.header("Chat Indexing")
 
     if not os.path.exists(CHAT_FILE):
-        st.error(f"{CHAT_FILE} not found in project directory")
+        st.error(f"{CHAT_FILE} not found")
     else:
         with open(CHAT_FILE, "r", encoding="utf-8") as f:
             chat_text = f.read()
 
         messages = parse_whatsapp_chat(chat_text)
-        st.success(f"Loaded {len(messages)} messages")
+        st.success(f"Loaded {len(messages):,} messages")
+        
+        docs = messages_to_documents(messages)
+        chunks = chunk_documents(docs)
+        st.info(f"Will create {len(chunks):,} chunks ({CHUNK_SIZE} messages per chunk)")
+        
+        # Estimate time
+        estimated_minutes = len(chunks) * 0.2 / 60  # Rough estimate: 0.2 seconds per chunk
+        st.info(f"Estimated time: ~{estimated_minutes:.1f} minutes")
 
-        if st.button("Build / Rebuild Index"):
-            docs = messages_to_documents(messages)
-            chunks = chunk_documents(docs)
-            build_vectorstore(chunks)
-            st.success("Vector index ready")
+        if st.button("Build / Rebuild Index", type="primary"):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            start_time = time.time()
+            
+            try:
+                build_vectorstore(chunks, progress_bar, status_text)
+                
+                elapsed_time = time.time() - start_time
+                minutes = int(elapsed_time // 60)
+                seconds = int(elapsed_time % 60)
+                
+                progress_bar.progress(1.0)
+                status_text.empty()
+                st.success(f"ector index ready! (Completed in {minutes}m {seconds}s)")
+                
+            except Exception as e:
+                status_text.empty()
+                st.error(f"Error building index: {str(e)}")
 
 
 # =========================
@@ -145,24 +224,47 @@ with tabs[1]:
     st.header("Ask Questions")
 
     if not os.path.exists(VECTOR_DIR):
-        st.warning("Index not found")
+        st.warning("Index not found. Please build the index first in the 'Index' tab.")
     else:
-        vs = load_vectorstore()
-        llm = ChatOpenAI(model="gpt-4.1", temperature=0)
+        vectorstore = load_vectorstore()
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 
-        qa = RetrievalQA.from_chain_type(
-            llm=llm,
-            retriever=vs.as_retriever(search_kwargs={"k": 5}),
-            chain_type="stuff"
+        prompt = ChatPromptTemplate.from_template(
+            """You are analyzing a WhatsApp chat history.
+
+Use ONLY the provided chat context to answer.
+If the answer is not present, say you don't know.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
         )
 
-        query = st.text_input("Ask about the chat")
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-flash-latest",
+            temperature=0,
+            google_api_key=GOOGLE_API_KEY
+        )
+
+        # Build RAG chain using LCEL
+        rag_chain = (
+            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+
+        query = st.text_input("Ask about the chat", placeholder="e.g., What topics were discussed most?")
 
         if query:
             with st.spinner("Thinking..."):
-                answer = qa.run(query)
+                response = rag_chain.invoke(query)
+
             st.markdown("### Answer")
-            st.write(answer)
+            st.write(response)
 
 
 # =========================
@@ -178,26 +280,33 @@ with tabs[2]:
             chat_text = f.read()
 
         messages = parse_whatsapp_chat(chat_text)
+        
+        st.info(f"Total messages: {len(messages):,}")
 
         start = st.number_input(
             "Start index",
             min_value=0,
-            max_value=len(messages)-1,
+            max_value=len(messages) - 1,
             value=0
         )
 
-        count = st.slider("Messages", 1, 50, 10)
-        speed = st.slider("Speed (seconds)", 0.1, 2.0, 0.5)
+        count = st.slider("Messages to replay", 1, 100, 20)
+        speed = st.slider("Speed (seconds per message)", 0.1, 2.0, 0.5)
 
         if st.button("Play"):
             placeholder = st.empty()
-            for m in messages[start:start+count]:
+            for idx, m in enumerate(messages[start:start + count]):
                 placeholder.markdown(
                     f"""
+                    **Message {start + idx + 1}/{len(messages)}**
+                    
                     **{m['sender']}**  
                     {m['datetime'].strftime('%d %b %Y, %I:%M:%S %p')}  
                     {m['message']}
+                    
                     ---
                     """
                 )
                 time.sleep(speed)
+            
+            st.success("Replay complete!")
