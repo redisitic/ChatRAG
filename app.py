@@ -9,6 +9,8 @@ from dateutil import parser as dateparser
 from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
+import sys
+from io import StringIO
 
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
@@ -35,6 +37,11 @@ except ImportError:
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
+if "google_api_key" not in st.session_state:
+    st.session_state.google_api_key = GOOGLE_API_KEY
+
+if "uploaded_chat_text" not in st.session_state:
+    st.session_state.uploaded_chat_text = None
 
 CHAT_FILE = "_chat.txt"
 VECTOR_DIR = "vectorstore"
@@ -341,7 +348,7 @@ def fast_analyze_all_messages(messages, progress_callback=None):
     if not vader:
         st.warning("VADER not available - analysis will be basic")
     if not emotion_model:
-        st.warning("Classifier not available - will use rule-based analysis")
+        st.warning("DistilBert not available")
     
     analyzed = []
     total = len(messages)
@@ -711,9 +718,32 @@ st.set_page_config(page_title="WhatsApp Chat RAG and Analyser", layout="wide")
 st.title("WhatsApp Chat RAG and Analyser")
 st.caption("idk why")
 
-if not GOOGLE_API_KEY:
-    st.error("GOOGLE_API_KEY not found in .env file.")
+st.sidebar.markdown("### Configuration")
+api_key_input = st.sidebar.text_input(
+    "Google API Key",
+    value=st.session_state.google_api_key or "",
+    type="password",
+    help="Enter your Google API key or it will use the one from .env file"
+)
+
+if api_key_input:
+    st.session_state.google_api_key = api_key_input
+    GOOGLE_API_KEY = api_key_input
+
+if not st.session_state.google_api_key:
+    st.error("GOOGLE_API_KEY not found. Please enter your Google API key in the sidebar.")
     st.stop()
+
+st.sidebar.markdown("### Chat File")
+uploaded_file = st.sidebar.file_uploader(
+    "Upload _chat.txt file",
+    type=["txt"],
+    help="Upload your WhatsApp chat export file"
+)
+
+if uploaded_file:
+    st.session_state.uploaded_chat_text = uploaded_file.read().decode('utf-8')
+    st.sidebar.success("File uploaded successfully")
 
 deps_ok = True
 if not VADER_AVAILABLE:
@@ -734,14 +764,24 @@ tabs = st.tabs([
 
 with tabs[0]:
     st.header("Analysis Pipeline")
+    chat_text = None
+    chat_source = "Unknown"
     
-    if not os.path.exists(CHAT_FILE):
-        st.error(f"{CHAT_FILE} not found")
+    if st.session_state.uploaded_chat_text:
+        chat_text = st.session_state.uploaded_chat_text
+        chat_source = "Uploaded File"
+    elif os.path.exists(CHAT_FILE):
+        with open(CHAT_FILE, "r", encoding="utf-8") as f:
+            chat_text = f.read()
+        chat_source = f"Local File ({CHAT_FILE})"
+    
+    if not chat_text:
+        st.error(f"No chat file found. Please upload a _chat.txt file or place it in the working directory.")
+        st.info("Use the file uploader in the sidebar to upload your WhatsApp chat export.")
     elif not deps_ok:
         st.error("Please install required dependencies first")
     else:
-        with open(CHAT_FILE, "r", encoding="utf-8") as f:
-            chat_text = f.read()
+        st.info(f"Using chat from: {chat_source}")
         
         messages = parse_whatsapp_chat(chat_text)
         st.success(f"Loaded {len(messages):,} messages")
@@ -772,7 +812,7 @@ with tabs[0]:
             
             interesting_count = st.slider(
                 "Important messages for deep LLM analysis",
-                50, 500, 100, 10,
+                10, min(500, len(messages)), min(100, len(messages)), 10,
                 help="Top N most important messages get detailed LLM analysis"
             )
         
@@ -793,12 +833,67 @@ with tabs[0]:
         with col1:
             if st.button("Run Analysis", type="primary", use_container_width=True):
                 progress_container = st.container()
+                console_container = st.container()
                 
                 with progress_container:
                     overall_progress = st.progress(0, text="Starting...")
                     stage_status = st.empty()
                     detail_status = st.empty()
                     time_status = st.empty()
+
+                console_placeholder = console_container.empty()
+                console_logs = []
+                
+                class ConsoleLogger:
+                    def __init__(self, original_stream):
+                        self.original_stream = original_stream
+                        self.buffer = []
+                    
+                    def write(self, message):
+                        self.original_stream.write(message)
+                        if message.strip():
+                            self.buffer.append(message.strip())
+                            console_logs.append(message.strip())
+                            if console_logs:
+                                with console_placeholder.container():
+                                    st.markdown("### Console Output")
+                                    console_text = "\n".join(console_logs[-50:])
+                                    st.markdown(
+                                        f"""
+                                        <div style="max-height: 200px; overflow-y: auto; border: 1px solid var(--border-color, #e0e0e0); border-radius: 4px; padding: 8px; background-color: var(--background-color); color: var(--text-color); font-family: monospace; font-size: 12px;">
+                                        <pre style="margin: 0; white-space: pre-wrap; word-wrap: break-word;">{console_text}</pre>
+                                        </div>
+                                        <style>
+                                        @media (prefers-color-scheme: dark) {{
+                                            :root {{
+                                                --border-color: #444;
+                                                --background-color: #1e1e1e;
+                                                --text-color: #e0e0e0;
+                                            }}
+                                        }}
+                                        @media (prefers-color-scheme: light) {{
+                                            :root {{
+                                                --border-color: #e0e0e0;
+                                                --background-color: #f5f5f5;
+                                                --text-color: #333;
+                                            }}
+                                        }}
+                                        </style>
+                                        """,
+                                        unsafe_allow_html=True
+                                    )
+                    
+                    def flush(self):
+                        self.original_stream.flush()
+                    
+                    def isatty(self):
+                        return self.original_stream.isatty()
+
+                old_stdout = sys.stdout
+                old_stderr = sys.stderr
+                logger = ConsoleLogger(old_stdout)
+                sys.stdout = logger
+                sys.stderr = logger
                 
                 try:
                     import time as time_module
@@ -839,7 +934,7 @@ with tabs[0]:
                     llm = ChatGoogleGenerativeAI(
                         model="gemini-flash-latest",
                         temperature=0.3,
-                        google_api_key=GOOGLE_API_KEY
+                        google_api_key=st.session_state.google_api_key
                     )
                     
                     messages_by_sender = defaultdict(list)
@@ -913,6 +1008,10 @@ with tabs[0]:
                     import traceback
                     with st.expander("Error details"):
                         st.code(traceback.format_exc())
+                
+                finally:
+                    sys.stdout = old_stdout
+                    sys.stderr = old_stderr
         
         with col2:
             if st.button("Build RAG Index", use_container_width=True):
@@ -946,7 +1045,7 @@ with tabs[0]:
                         status.text("Creating embeddings...")
                         embeddings = GoogleGenerativeAIEmbeddings(
                             model="models/text-embedding-004",
-                            google_api_key=GOOGLE_API_KEY
+                            google_api_key=st.session_state.google_api_key
                         )
                         vs = FAISS.from_documents(chunks, embeddings)
                         vs.save_local(VECTOR_DIR)
@@ -1086,7 +1185,7 @@ with tabs[4]:
     else:
         embeddings = GoogleGenerativeAIEmbeddings(
             model="models/text-embedding-004",
-            google_api_key=GOOGLE_API_KEY
+            google_api_key=st.session_state.google_api_key
         )
         vectorstore = FAISS.load_local(
             VECTOR_DIR,
@@ -1098,7 +1197,7 @@ with tabs[4]:
         llm = ChatGoogleGenerativeAI(
             model="gemini-flash-latest",
             temperature=0,
-            google_api_key=GOOGLE_API_KEY
+            google_api_key=st.session_state.google_api_key
         )
         
         prompt = ChatPromptTemplate.from_template(
