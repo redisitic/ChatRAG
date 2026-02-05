@@ -868,18 +868,41 @@ with tabs[0]:
             )
             
             if use_sampling:
+                slider_min = min(1000, len(messages) // 2)
+                slider_max = min(20000, len(messages))
+                slider_default = min(5000, len(messages))
+                slider_step = 100
+                
+                if slider_min >= slider_max:
+                    slider_min = max(1, slider_max - 1)
+                if slider_default > slider_max:
+                    slider_default = slider_max
+                if slider_default < slider_min:
+                    slider_default = slider_min
+                
                 sample_target = st.slider(
                     "Target messages for analysis",
-                    1000, min(20000, len(messages)),
-                    min(5000, len(messages)),
-                    500
+                    slider_min, slider_max,
+                    slider_default,
+                    slider_step
                 )
             else:
                 sample_target = len(messages)
             
+            interesting_min = 10
+            interesting_max = min(500, len(messages))
+            interesting_default = min(100, len(messages))
+            
+            if interesting_min >= interesting_max:
+                interesting_min = max(1, interesting_max - 1)
+            if interesting_default > interesting_max:
+                interesting_default = interesting_max
+            if interesting_default < interesting_min:
+                interesting_default = interesting_min
+            
             interesting_count = st.slider(
                 "Important messages for deep LLM analysis",
-                10, min(500, len(messages)), min(100, len(messages)), 10,
+                interesting_min, interesting_max, interesting_default, 10,
                 help="Top N most important messages get detailed LLM analysis"
             )
         
