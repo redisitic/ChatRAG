@@ -214,6 +214,9 @@ def calculate_message_importance(msg, idx, total_messages, day_boundaries, sende
 def smart_sample_messages(messages, target_count, base_sample_rate=None):
     total = len(messages)
     
+    if target_count >= total:
+        return messages, [1.0] * total
+    
     sender_stats = {}
     for msg in messages:
         sender = msg["sender"]
@@ -251,21 +254,16 @@ def smart_sample_messages(messages, target_count, base_sample_rate=None):
             "importance": min(1.0, importance)
         })
     
-    if base_sample_rate and base_sample_rate > 1:
-        base_sampled = [scored_messages[i] for i in range(0, len(scored_messages), base_sample_rate)]
-    else:
-        base_sampled = scored_messages
-    
-    if len(base_sampled) <= target_count:
-        selected = base_sampled
+    if len(scored_messages) <= target_count:
+        selected = scored_messages
     else:
         threshold = 0.5
-        high_importance = [m for m in base_sampled if m["importance"] >= threshold]
+        high_importance = [m for m in scored_messages if m["importance"] >= threshold]
         
         remaining_slots = target_count - len(high_importance)
         
         if remaining_slots > 0:
-            others = [m for m in base_sampled if m["importance"] < threshold]
+            others = [m for m in scored_messages if m["importance"] < threshold]
             others_sorted = sorted(others, key=lambda x: x["importance"], reverse=True)
             selected = high_importance + others_sorted[:remaining_slots]
         else:
@@ -776,7 +774,8 @@ def format_docs(docs):
 
 st.set_page_config(page_title="WhatsApp Chat RAG and Analyser", layout="wide")
 st.title("WhatsApp Chat RAG and Analyser")
-st.caption("idk why")
+st.markdown("#### Clone and Use Offline Version for best performance and to sustain database between sessions.")
+st.markdown("##### For security reasons, all data is expunged when session ends (that means if you hit refresh, you'd need to start over).")
 
 st.sidebar.markdown("### Configuration")
 api_key_input = st.sidebar.text_input(
