@@ -910,6 +910,7 @@ with tabs[0]:
 
                 console_placeholder = console_container.empty()
                 console_logs = []
+                last_update = [0]
                 
                 class ConsoleLogger:
                     def __init__(self, original_stream):
@@ -921,7 +922,10 @@ with tabs[0]:
                         if message.strip():
                             self.buffer.append(message.strip())
                             console_logs.append(message.strip())
-                            if console_logs:
+                            current_time = time.time()
+                            if current_time - last_update[0] > 0.5 and console_logs:
+                                last_update[0] = current_time
+                                console_placeholder.empty()
                                 with console_placeholder.container():
                                     st.markdown("### Console Output")
                                     console_text = "\n".join(console_logs[-50:])
